@@ -16,11 +16,11 @@ RUN pip install poetry
 RUN poetry config virtualenvs.create false \
     && poetry config cache-dir /tmp
 
-# Copy poetry files first for better caching
-COPY pyproject.toml poetry.lock* ./
+# Copy poetry files and README first for better caching
+COPY pyproject.toml poetry.lock* README.md ./
 
-# Install dependencies
-RUN poetry install --only=main --no-cache
+# Install dependencies only (don't install the package itself)
+RUN poetry install --only=main --no-root --no-cache
 
 # Copy application code
 COPY . .

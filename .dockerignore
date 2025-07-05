@@ -44,6 +44,3 @@ output/
 .env.development.local
 .env.test.local
 .env.production.local
-
-# Poetry
-poetry.lock

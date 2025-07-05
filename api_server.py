@@ -382,8 +382,9 @@ async def shutdown_sandbox():
 
 def main():
     """Start the FastAPI server"""
+    port = int(os.getenv("PORT", 8000))  # Railway provides PORT env var
     uvicorn.run(
-        "api_server:app", host="0.0.0.0", port=8000, reload=True, log_level="info"
+        "api_server:app", host="0.0.0.0", port=port, reload=False, log_level="info"
     )
 
 

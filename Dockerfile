@@ -25,15 +25,18 @@ RUN poetry install --only=main --no-root --no-cache
 # Copy application code
 COPY . .
 
+# Now install the package itself so poetry scripts work
+RUN poetry install --only-root
+
 # Create output directory
 RUN mkdir -p output
 
-# Expose port
+# Expose port (Railway will override with dynamic port)
 EXPOSE 8000
 
-# Health check
+# Health check (Railway will handle port mapping)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-    CMD curl -f http://localhost:8000/status || exit 1
+    CMD curl -f http://localhost:${PORT:-8000}/status || exit 1
 
-# Run the application
-CMD ["uvicorn", "api_server:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run the application using poetry script
+CMD ["poetry", "run", "api"]

@@ -130,3 +130,50 @@ poetry run start --prompt "use the web browser to get the current weather in sf"
 
 The display stream should be visible a few seconds after the Python program starts.
 
+## API Mode
+
+For integration with other applications (like Node.js backends), you can run the agent as a FastAPI server:
+
+### Start the API server
+
+```sh
+poetry run api
+```
+
+This starts a FastAPI server on `http://localhost:8000` with the following endpoints:
+
+- `GET /status` - Check if the agent is ready
+- `GET /screenshot` - Get current screenshot
+- `POST /act` - Execute actions with natural language instructions
+- `POST /click` - Click on specific elements
+- `POST /type` - Type text
+- `POST /key` - Send key combinations
+- `POST /command` - Run shell commands
+- `POST /reset` - Reset agent memory
+
+### Node.js Integration
+
+Install the Node.js dependencies:
+
+```sh
+npm install axios
+```
+
+Use the provided client:
+
+```javascript
+const ComputerUseClient = require('./nodejs_client_example.js');
+
+const client = new ComputerUseClient();
+
+// Execute an action
+const result = await client.executeAction("Open Firefox browser");
+console.log('Action completed:', result.success);
+
+// Get a screenshot
+const screenshot = await client.getScreenshot();
+console.log('Screenshot:', screenshot.timestamp);
+```
+
+See [API_README.md](API_README.md) for complete API documentation and examples.
+

@@ -1,0 +1,16 @@
+{
+  "name": "computer-use-client-example",
+  "version": "1.0.0",
+  "description": "Node.js client example for Computer Use Agent API",
+  "main": "nodejs_client_example.js",
+  "scripts": {
+    "test": "node nodejs_client_example.js",
+    "start": "node nodejs_client_example.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0"
+  },
+  "keywords": ["computer-use", "automation", "api-client"],
+  "author": "",
+  "license": "Apache-2.0"
+}

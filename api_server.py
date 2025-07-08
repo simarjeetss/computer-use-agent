@@ -1,5 +1,16 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    UploadFile,
+    File,
+    Form,
+    Depends,
+    Header,
+    status,
+    Request,
+)
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import uvicorn
@@ -9,10 +20,15 @@ import io
 import os
 import tempfile
 import json
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
+from collections import defaultdict
+import threading
 
 from os_computer_use.streaming import Sandbox
 from os_computer_use.api_agent import APISandboxAgent
+from os_computer_use.demo_agent import DemoAgent
+from os_computer_use.demo_orchestrator import DemoOrchestrator
 from os_computer_use.logging import Logger
 from dotenv import load_dotenv
 
@@ -20,15 +36,37 @@ from dotenv import load_dotenv
 load_dotenv()
 os.environ["E2B_API_KEY"] = os.getenv("E2B_API_KEY")
 
+# Security Configuration
+API_KEY = os.getenv("API_KEY")  # Add this to your Railway environment
+ALLOWED_ORIGINS = (
+    os.getenv("ALLOWED_ORIGINS", "").split(",")
+    if os.getenv("ALLOWED_ORIGINS")
+    else ["*"]
+)
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "10"))
+REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "300"))  # 5 minutes
+SANDBOX_MAX_LIFETIME_MINUTES = int(os.getenv("SANDBOX_MAX_LIFETIME_MINUTES", "30"))
+
 app = FastAPI(title="Computer Use Agent API", version="1.0.0")
 
-# Add CORS middleware for Node.js integration
+# Security: HTTPBearer for API key authentication
+security = HTTPBearer(auto_error=False)
+
+# Rate limiting storage
+rate_limit_storage = defaultdict(list)
+rate_limit_lock = threading.Lock()
+
+# Sandbox cleanup tracking
+sandbox_created_at = None
+cleanup_timer = None
+
+# Add CORS middleware with restricted origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure this for production
+    allow_origins=ALLOWED_ORIGINS,  # Restricted to specific domains
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],  # Only necessary methods
+    allow_headers=["Authorization", "Content-Type"],  # Specific headers only
 )
 
 # Global variables for sandbox and agent
@@ -37,7 +75,85 @@ agent = None
 logger = Logger()
 
 
-# Request/Response Models
+# Security Functions
+def verify_api_key(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Verify API key authentication"""
+    if not API_KEY:
+        # If no API key is set, allow access (for backward compatibility)
+        return True
+
+    if not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing API key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if credentials.credentials != API_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid API key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return True
+
+
+def rate_limit_check(client_ip: str = None):
+    """Check rate limiting per IP"""
+    if not client_ip:
+        client_ip = "unknown"
+
+    with rate_limit_lock:
+        current_time = time.time()
+        # Clean old entries (older than 1 minute)
+        rate_limit_storage[client_ip] = [
+            timestamp
+            for timestamp in rate_limit_storage[client_ip]
+            if current_time - timestamp < 60
+        ]
+
+        # Check if rate limit exceeded
+        if len(rate_limit_storage[client_ip]) >= RATE_LIMIT_PER_MINUTE:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"Rate limit exceeded. Max {RATE_LIMIT_PER_MINUTE} requests per minute.",
+            )
+
+        # Add current request
+        rate_limit_storage[client_ip].append(current_time)
+
+
+def schedule_sandbox_cleanup():
+    """Schedule automatic sandbox cleanup"""
+    global cleanup_timer, sandbox_created_at
+
+    def cleanup_sandbox():
+        global sandbox, agent, sandbox_created_at, cleanup_timer
+        if sandbox:
+            try:
+                print(
+                    f"🧹 Auto-cleanup: Shutting down sandbox after {SANDBOX_MAX_LIFETIME_MINUTES} minutes"
+                )
+                sandbox.kill()
+                sandbox = None
+                agent = None
+                sandbox_created_at = None
+                cleanup_timer = None
+            except Exception as e:
+                print(f"Error during auto-cleanup: {e}")
+
+    if cleanup_timer:
+        cleanup_timer.cancel()
+
+    cleanup_timer = threading.Timer(SANDBOX_MAX_LIFETIME_MINUTES * 60, cleanup_sandbox)
+    cleanup_timer.start()
+    sandbox_created_at = datetime.now()
+
+
+# Request/Response Models (keeping existing ones)
 class ActionRequest(BaseModel):
     instruction: str
     screenshot: Optional[str] = None  # Base64 encoded screenshot
@@ -63,11 +179,47 @@ class StatusResponse(BaseModel):
     status: str
     sandbox_active: bool
     agent_initialized: bool
+    sandbox_uptime_minutes: Optional[float] = None
+    rate_limit_remaining: Optional[int] = None
 
 
 class StreamResponse(BaseModel):
     stream_url: str
     timestamp: str
+
+
+# Demo-specific models
+class DemoSessionRequest(BaseModel):
+    githubUrl: str
+    meetLink: str
+
+
+class DemoSessionResponse(BaseModel):
+    sessionId: str
+    sandboxUrl: str
+    status: str
+    currentStep: Optional[str] = None
+    stepProgress: str
+    logs: List[Dict[str, Any]] = []
+    estimatedCompletion: Optional[str] = None
+    timestamp: str
+
+
+class DemoStatusResponse(BaseModel):
+    sessionId: str
+    status: str
+    completedSteps: List[str]
+    currentStep: Optional[str] = None
+    stepProgress: str
+    logs: List[Dict[str, Any]]
+    sandboxUrl: Optional[str] = None
+    runtimeMinutes: float
+    timestamp: str
+
+
+# Global variables for demo sessions
+demo_sessions = {}  # Store active demo sessions
+demo_agents = {}  # Store demo agents by session ID
 
 
 # Helper functions
@@ -78,15 +230,17 @@ def initialize_sandbox_and_agent():
     if sandbox is None:
         try:
             sandbox = Sandbox()
-            # Don't start VNC for API mode, just ensure sandbox is ready
-            sandbox.set_timeout(1800)  # 30 minutes timeout instead of 1 minute
+            # Set reasonable timeout
+            sandbox.set_timeout(REQUEST_TIMEOUT_SECONDS)
 
             # Start VNC stream to get the URL for viewing
             sandbox.stream.start()
             vnc_url = sandbox.stream.get_url()
             print(f"🖥️  Sandbox initialized successfully")
             print(f"🌐 View desktop at: {vnc_url}")
-            print(f"📱 You can open this URL in your browser to see the desktop")
+
+            # Schedule automatic cleanup
+            schedule_sandbox_cleanup()
 
         except Exception as e:
             print(f"Error initializing sandbox: {e}")
@@ -99,9 +253,9 @@ def initialize_sandbox_and_agent():
             output_dir = f"./output/api_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
             os.makedirs(output_dir, exist_ok=True)
             agent = APISandboxAgent(sandbox, output_dir, save_logs=True)
-            print("Agent initialized successfully")
+            print("✅ Agent initialized successfully")
         except Exception as e:
-            print(f"Error initializing agent: {e}")
+            print(f"❌ Error initializing agent: {e}")
             raise HTTPException(
                 status_code=500, detail=f"Failed to initialize agent: {str(e)}"
             )
@@ -141,19 +295,53 @@ async def shutdown_event():
 
 
 @app.get("/status", response_model=StatusResponse)
-async def get_status():
+async def get_status(request: Request, _: bool = Depends(verify_api_key)):
     """Get the current status of the agent and sandbox"""
-    return StatusResponse(
-        status="running",
-        sandbox_active=sandbox is not None,
-        agent_initialized=agent is not None,
-    )
+    try:
+        # Get client IP for rate limiting
+        client_ip = request.client.host if request.client else "unknown"
+
+        # Apply rate limiting
+        rate_limit_check(client_ip)
+
+        uptime = None
+        if sandbox_created_at:
+            uptime = (
+                datetime.now() - sandbox_created_at
+            ).total_seconds() / 60  # in minutes
+
+        rate_limit_remaining = None
+        with rate_limit_lock:
+            if client_ip in rate_limit_storage:
+                # Clean old entries
+                rate_limit_storage[client_ip] = [
+                    timestamp
+                    for timestamp in rate_limit_storage[client_ip]
+                    if time.time() - timestamp < 60
+                ]
+                rate_limit_remaining = RATE_LIMIT_PER_MINUTE - len(
+                    rate_limit_storage[client_ip]
+                )
+
+        return StatusResponse(
+            status="running",
+            sandbox_active=sandbox is not None,
+            agent_initialized=agent is not None,
+            sandbox_uptime_minutes=uptime,
+            rate_limit_remaining=rate_limit_remaining,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to get status: {str(e)}")
 
 
 @app.get("/screenshot", response_model=ScreenshotResponse)
-async def get_screenshot():
+async def get_screenshot(request: Request, _: bool = Depends(verify_api_key)):
     """Get current screenshot from the sandbox"""
     try:
+        # Apply rate limiting
+        client_ip = request.client.host if request.client else "unknown"
+        rate_limit_check(client_ip)
+
         initialize_sandbox_and_agent()
         screenshot_bytes = agent.screenshot()
         screenshot_b64 = screenshot_to_base64(screenshot_bytes)
@@ -168,9 +356,13 @@ async def get_screenshot():
 
 
 @app.get("/stream", response_model=StreamResponse)
-async def get_stream_url():
+async def get_stream_url(request: Request, _: bool = Depends(verify_api_key)):
     """Get the VNC stream URL for viewing the desktop"""
     try:
+        # Apply rate limiting
+        client_ip = request.client.host if request.client else "unknown"
+        rate_limit_check(client_ip)
+
         initialize_sandbox_and_agent()
 
         # Get the VNC stream URL
@@ -186,22 +378,28 @@ async def get_stream_url():
 
 
 @app.post("/act", response_model=ActionResponse)
-async def execute_action(request: ActionRequest):
+async def execute_action(
+    action_request: ActionRequest, request: Request, _: bool = Depends(verify_api_key)
+):
     """Execute an action based on instruction"""
     try:
+        # Apply rate limiting
+        client_ip = request.client.host if request.client else "unknown"
+        rate_limit_check(client_ip)
+
         initialize_sandbox_and_agent()
 
-        print(f"🚀 Executing action: '{request.instruction}'")
-        print(f"📋 Single step mode: {request.single_step}")
+        print(f"🚀 Executing action: '{action_request.instruction}'")
+        print(f"📋 Single step mode: {action_request.single_step}")
 
         # If a screenshot is provided, we could potentially use it
         # For now, we'll always take a fresh screenshot
 
         actions_taken = []
 
-        if request.single_step:
+        if action_request.single_step:
             # Execute only one step
-            result = agent.execute_single_step(request.instruction)
+            result = agent.execute_single_step(action_request.instruction)
             actions_taken.append(result)
             completed = result.get("completed", False)
             completion_reason = (
@@ -211,7 +409,9 @@ async def execute_action(request: ActionRequest):
             print(f"✅ Single step completed: {result.get('action', 'unknown')}")
         else:
             # Execute the full instruction (may take multiple steps)
-            actions_taken, completed = agent.run_with_tracking(request.instruction)
+            actions_taken, completed = agent.run_with_tracking(
+                action_request.instruction
+            )
             iterations = len(
                 [
                     a
@@ -257,9 +457,16 @@ async def execute_action(request: ActionRequest):
 
 
 @app.post("/click")
-async def click_element(query: str = Form(...)):
+async def click_element(
+    query: str = Form(...), request: Request = None, _: bool = Depends(verify_api_key)
+):
     """Click on a specific element"""
     try:
+        # Apply rate limiting
+        if request:
+            client_ip = request.client.host if request.client else "unknown"
+            rate_limit_check(client_ip)
+
         initialize_sandbox_and_agent()
         result = agent.click(query)
 
@@ -280,9 +487,16 @@ async def click_element(query: str = Form(...)):
 
 
 @app.post("/type")
-async def type_text(text: str = Form(...)):
+async def type_text(
+    text: str = Form(...), request: Request = None, _: bool = Depends(verify_api_key)
+):
     """Type text into the current focus"""
     try:
+        # Apply rate limiting
+        if request:
+            client_ip = request.client.host if request.client else "unknown"
+            rate_limit_check(client_ip)
+
         initialize_sandbox_and_agent()
         result = agent.type_text(text)
 
@@ -301,9 +515,16 @@ async def type_text(text: str = Form(...)):
 
 
 @app.post("/key")
-async def send_key(key: str = Form(...)):
+async def send_key(
+    key: str = Form(...), request: Request = None, _: bool = Depends(verify_api_key)
+):
     """Send a key combination"""
     try:
+        # Apply rate limiting
+        if request:
+            client_ip = request.client.host if request.client else "unknown"
+            rate_limit_check(client_ip)
+
         initialize_sandbox_and_agent()
         result = agent.send_key(key)
 
@@ -322,9 +543,19 @@ async def send_key(key: str = Form(...)):
 
 
 @app.post("/command")
-async def run_command(command: str = Form(...), background: bool = Form(False)):
+async def run_command(
+    command: str = Form(...),
+    background: bool = Form(False),
+    request: Request = None,
+    _: bool = Depends(verify_api_key),
+):
     """Run a shell command"""
     try:
+        # Apply rate limiting
+        if request:
+            client_ip = request.client.host if request.client else "unknown"
+            rate_limit_check(client_ip)
+
         initialize_sandbox_and_agent()
 
         if background:
@@ -344,9 +575,14 @@ async def run_command(command: str = Form(...), background: bool = Form(False)):
 
 
 @app.post("/reset")
-async def reset_agent():
+async def reset_agent(request: Request = None, _: bool = Depends(verify_api_key)):
     """Reset the agent's conversation memory"""
     try:
+        # Apply rate limiting
+        if request:
+            client_ip = request.client.host if request.client else "unknown"
+            rate_limit_check(client_ip)
+
         initialize_sandbox_and_agent()
         agent.messages = []
 
@@ -356,17 +592,26 @@ async def reset_agent():
 
 
 @app.post("/shutdown")
-async def shutdown_sandbox():
+async def shutdown_sandbox(request: Request = None, _: bool = Depends(verify_api_key)):
     """Shutdown and kill the sandbox"""
-    global sandbox, agent
+    global sandbox, agent, cleanup_timer
 
     try:
-        if sandbox:
-            print("Shutting down sandbox...")
-            sandbox.kill()
-            print("Sandbox stopped successfully")
+        # Apply rate limiting
+        if request:
+            client_ip = request.client.host if request.client else "unknown"
+            rate_limit_check(client_ip)
 
-            # Reset global variables
+        if sandbox:
+            print("🧹 Manual shutdown: Shutting down sandbox...")
+            sandbox.kill()
+            print("✅ Sandbox stopped successfully")
+
+            # Cancel cleanup timer and reset global variables
+            if cleanup_timer:
+                cleanup_timer.cancel()
+                cleanup_timer = None
+
             sandbox = None
             agent = None
 
@@ -374,9 +619,173 @@ async def shutdown_sandbox():
         else:
             return {"success": True, "message": "No active sandbox to shutdown"}
     except Exception as e:
-        print(f"Error during shutdown: {str(e)}")
+        print(f"❌ Error during shutdown: {str(e)}")
         raise HTTPException(
             status_code=500, detail=f"Failed to shutdown sandbox: {str(e)}"
+        )
+
+
+# Demo Session Endpoints
+@app.post("/demo-session", response_model=DemoSessionResponse)
+async def create_demo_session(
+    demo_request: DemoSessionRequest,
+    request: Request,
+    _: bool = Depends(verify_api_key),
+):
+    """Create a new demo session with GitHub repository and Google Meet integration"""
+    try:
+        # Apply rate limiting
+        client_ip = request.client.host if request.client else "unknown"
+        rate_limit_check(client_ip)
+
+        # Initialize sandbox and create demo agent
+        demo_sandbox = Sandbox()
+        demo_sandbox.set_timeout(REQUEST_TIMEOUT_SECONDS)
+
+        # Start VNC stream
+        demo_sandbox.stream.start()
+        sandbox_url = demo_sandbox.stream.get_url()
+
+        # Create demo agent
+        output_dir = f"./output/demo_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        os.makedirs(output_dir, exist_ok=True)
+        demo_agent = DemoAgent(demo_sandbox, output_dir, save_logs=True)
+
+        # Initialize demo session
+        session_id = demo_agent.initialize_demo_session(
+            demo_request.githubUrl, demo_request.meetLink
+        )
+
+        # Store session for tracking
+        demo_sessions[session_id] = {
+            "agent": demo_agent,
+            "sandbox": demo_sandbox,
+            "orchestrator": DemoOrchestrator(demo_agent),
+            "status": "initialized",
+            "created_at": datetime.now(),
+        }
+
+        # Start demo execution in background
+        import asyncio
+
+        async def run_demo_background():
+            try:
+                orchestrator = demo_sessions[session_id]["orchestrator"]
+                await orchestrator.run_full_demo(
+                    demo_request.githubUrl, demo_request.meetLink
+                )
+                demo_sessions[session_id]["status"] = "completed"
+            except Exception as e:
+                logger.log(f"Demo execution error: {e}", "red")
+                demo_sessions[session_id]["status"] = "failed"
+
+        # Execute in background
+        asyncio.create_task(run_demo_background())
+
+        # Return immediate response
+        return DemoSessionResponse(
+            sessionId=session_id,
+            sandboxUrl=sandbox_url,
+            status="running",
+            currentStep="open_terminal",
+            stepProgress="0/8",
+            logs=[],
+            estimatedCompletion=(datetime.now() + timedelta(minutes=5)).isoformat(),
+            timestamp=datetime.now().isoformat(),
+        )
+
+    except Exception as e:
+        logger.log(f"Error creating demo session: {e}", "red")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to create demo session: {str(e)}"
+        )
+
+
+@app.get("/demo-session/{session_id}/status", response_model=DemoStatusResponse)
+async def get_demo_status(
+    session_id: str, request: Request, _: bool = Depends(verify_api_key)
+):
+    """Get the current status of a demo session"""
+    try:
+        # Apply rate limiting
+        client_ip = request.client.host if request.client else "unknown"
+        rate_limit_check(client_ip)
+
+        # Check if session exists
+        if session_id not in demo_sessions:
+            raise HTTPException(
+                status_code=404, detail=f"Demo session {session_id} not found"
+            )
+
+        session_data = demo_sessions[session_id]
+        demo_agent = session_data["agent"]
+        orchestrator = session_data["orchestrator"]
+
+        # Get progress status from agent
+        progress = demo_agent.get_progress_status()
+
+        return DemoStatusResponse(
+            sessionId=session_id,
+            status=progress["status"],
+            completedSteps=progress["completed_steps"],
+            currentStep=progress["current_step"],
+            stepProgress=progress["step_progress"],
+            logs=orchestrator.execution_log,
+            sandboxUrl=progress["sandbox_url"],
+            runtimeMinutes=progress["runtime_minutes"],
+            timestamp=datetime.now().isoformat(),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.log(f"Error getting demo status: {e}", "red")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to get demo status: {str(e)}"
+        )
+
+
+@app.post("/demo-session/{session_id}/cleanup")
+async def cleanup_demo_session(
+    session_id: str, request: Request, _: bool = Depends(verify_api_key)
+):
+    """Clean up and terminate a demo session"""
+    try:
+        # Apply rate limiting
+        client_ip = request.client.host if request.client else "unknown"
+        rate_limit_check(client_ip)
+
+        # Check if session exists
+        if session_id not in demo_sessions:
+            raise HTTPException(
+                status_code=404, detail=f"Demo session {session_id} not found"
+            )
+
+        session_data = demo_sessions[session_id]
+        demo_agent = session_data["agent"]
+        demo_sandbox = session_data["sandbox"]
+
+        # Clean up resources
+        demo_agent.cleanup_demo_session()
+        demo_sandbox.kill()
+
+        # Remove from active sessions
+        del demo_sessions[session_id]
+
+        logger.log(f"Demo session {session_id} cleaned up successfully", "green")
+
+        return {
+            "success": True,
+            "message": f"Demo session {session_id} cleaned up successfully",
+            "timestamp": datetime.now().isoformat(),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.log(f"Error cleaning up demo session: {e}", "red")
+        raise HTTPException(
+            status_code=500, detail=f"Failed to cleanup demo session: {str(e)}"
         )
 
 

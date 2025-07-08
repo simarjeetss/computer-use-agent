@@ -3,25 +3,29 @@ import asyncio
 import os
 import signal
 import sys
+import time
 
 
 class Sandbox(SandboxBase):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.vnc_port = 5900
+        self.vnc_process = None
 
     def start_stream(self):
-        # Command to start streaming using ffmpeg
-        command = "ffmpeg -f x11grab -s 1024x768 -framerate 30 -i {self._display} -vcodec libx264 -preset ultrafast -tune zerolatency -f mpegts -listen 1 http://localhost:8080"
-        # Run the command in the background
-        process = self.commands.run(
-            command,
-            background=True,
-        )
-        self.process = process
-        return f"https://{self.get_host(8080)}"
+        # Start VNC server
+        self.commands.run("x11vnc -display :0 -forever -shared -rfbport 5900", background=True)
+        # Wait a moment for the VNC server to start
+        time.sleep(2)
+        return f"https://{self.get_host(self.vnc_port)}"
 
     def kill(self):
-        # Kill the streaming process along with the sandbox
-        if hasattr(self, "process"):
-            self.process.kill()
+        # Kill the VNC server process
+        if self.vnc_process:
+            try:
+                self.vnc_process.kill()
+            except:
+                pass
         super().kill()
 
 

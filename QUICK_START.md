@@ -13,7 +13,8 @@ I've successfully wrapped your computer-use agent in a FastAPI server that expos
 
 ### Documentation & Examples:
 - `API_README.md` - Complete API documentation
-- `nodejs_client_example.js` - Node.js client library
+- `nodejs_client_secure.js` - Secure Node.js client library
+- `nodejs_client_demo.js` - Demo-specific Node.js client
 - `package.json` - Node.js dependencies
 - `test_api.py` - Python test script
 
@@ -30,7 +31,7 @@ The server runs on `http://localhost:8000`
 ### 2. From Node.js
 
 ```javascript
-const ComputerUseClient = require('./nodejs_client_example.js');
+const ComputerUseClient = require('./nodejs_client_secure.js');
 const client = new ComputerUseClient();
 
 // Execute an action
@@ -94,7 +95,7 @@ Or test the Node.js client:
 
 ```bash
 npm install axios
-node nodejs_client_example.js
+node nodejs_client_secure.js
 ```
 
 The agent now runs as a proper HTTP API server that your Node.js application can communicate with!

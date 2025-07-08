@@ -1,11 +1,14 @@
 {
-  "name": "computer-use-client-example",
+  "name": "computer-use-client",
   "version": "1.0.0",
-  "description": "Node.js client example for Computer Use Agent API",
-  "main": "nodejs_client_example.js",
+  "description": "Node.js clients for Computer Use Agent API testing",
+  "main": "nodejs_client.js",
   "scripts": {
-    "test": "node nodejs_client_example.js",
-    "start": "node nodejs_client_example.js"
+    "test": "node nodejs_client.js",
+    "start": "node nodejs_client.js",
+    "test-demo": "node nodejs_client_demo.js",
+    "demo": "node nodejs_client_demo.js",
+    "production": "node nodejs_client.js"
   },
   "dependencies": {
     "axios": "^1.6.0"

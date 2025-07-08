@@ -12,6 +12,7 @@ https://github.com/user-attachments/assets/3837c4f6-45cb-43f2-9d51-a45f742424d4
 - Live streams the display of the sandbox on the client computer
 - User can pause and prompt the agent at any time
 - Uses Ubuntu, but designed to work with any operating system
+- Automatic repository setup and development environment configuration
 
 ## Design
 
@@ -51,6 +52,45 @@ The providers are imported from [providers.py](/os_computer_use/providers.py) an
 - Mistral AI (Pixtral for vision, Mistral Large for actions)
 
 If you add a new model or provider, please [make a PR](../../pulls) to this repository with the updated providers.py!
+
+## Repository Setup Feature
+
+The project includes a specialized agent for automatically setting up and running GitHub repositories. This feature:
+
+1. Clones any public GitHub repository
+2. Automatically detects the technology stack
+3. Installs required dependencies
+4. Sets up a development environment with code-server
+5. Runs the project if possible
+
+### Using the Repository Setup Feature
+
+1. Make sure you have the required environment variables set up in your `.env` file
+2. Run the repository setup command:
+
+```sh
+poetry run python repo_setup.py https://github.com/username/repository
+```
+
+The agent will:
+- Clone the repository
+- Detect the technology stack (Python, Node.js, Ruby, Java, etc.)
+- Install dependencies using the appropriate package manager
+- Open the code in a web-based VS Code interface
+- Start the project if a run command is detected
+
+The web-based VS Code interface will be available at `http://localhost:8080` once the setup is complete.
+
+### Supported Technology Stacks
+
+The agent can automatically detect and set up:
+
+- Python projects (pip, poetry)
+- Node.js projects (npm, yarn)
+- Ruby projects (bundler)
+- Java/Kotlin projects (maven, gradle)
+
+More technology stacks can be added by extending the `RepoSetupAgent` class.
 
 ## Get started
 
@@ -162,7 +202,7 @@ npm install axios
 Use the provided client:
 
 ```javascript
-const ComputerUseClient = require('./nodejs_client_example.js');
+const ComputerUseClient = require('./nodejs_client_secure.js');
 
 const client = new ComputerUseClient();
 

@@ -112,9 +112,27 @@ class SandboxAgent:
         params={"text": "Text to type"},
     )
     def type_text(self, text):
-        self.sandbox.write(
-            text, chunk_size=TYPING_GROUP_SIZE, delay_in_ms=TYPING_DELAY_MS
-        )
+        # Workaround for E2B sandbox xdotool type issue with hyphens
+        # The issue is that text with hyphens gets interpreted as command flags
+        # by the underlying xdotool type command
+
+        # For terminal commands, warn but still type character by character
+        if text.startswith(("git ", "npm ", "python ", "pip ", "curl ", "wget ")):
+            print(
+                f"⚠️  Warning: For terminal commands like '{text}', consider using run_command instead of type_text to avoid escaping issues."
+            )
+            # Type character by character for terminal commands
+            for char in text:
+                self.sandbox.write(char, chunk_size=1, delay_in_ms=TYPING_DELAY_MS)
+        elif "--" in text or (text.count("-") > 2 and "http" in text):
+            # Type character by character for problematic text (URLs with many hyphens)
+            for char in text:
+                self.sandbox.write(char, chunk_size=1, delay_in_ms=TYPING_DELAY_MS)
+        else:
+            # Original behavior for safe text
+            self.sandbox.write(
+                text, chunk_size=TYPING_GROUP_SIZE, delay_in_ms=TYPING_DELAY_MS
+            )
         return "The text has been typed."
 
     def click_element(self, query, click_command, action_name="click"):
